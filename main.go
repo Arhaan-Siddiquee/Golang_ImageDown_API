@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -129,10 +130,25 @@ func DownloadImagesConcurrently(imageURLs []string, destDir string) {
 }
 
 func main() {
-	exampleURLs := []string{
-		"https://arhaan-dev.vercel.app/assets/me-BscloOhD.png",
-	}
-	destinationDirectory := "downloaded_images"
+	scanner := bufio.NewScanner(os.Stdin)
+	var urls []string
 
-	DownloadImagesConcurrently(exampleURLs, destinationDirectory)
+	fmt.Println("Enter image URLs (one per line). Press Enter on an empty line to start downloading:")
+	for scanner.Scan() {
+		url := strings.TrimSpace(scanner.Text())
+		if url == "" {
+			break
+		}
+		urls = append(urls, url)
+	}
+
+	if len(urls) == 0 {
+		fmt.Println("No URLs provided. Exiting.")
+		return
+	}
+
+	destinationDirectory := "downloaded_images"
+	fmt.Printf("Downloading %d images to %s...\n", len(urls), destinationDirectory)
+	
+	DownloadImagesConcurrently(urls, destinationDirectory)
 }
