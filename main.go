@@ -1,8 +1,8 @@
 package main
 
 import (
-	"bufio"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,14 +12,11 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"time"
 )
 
 func downloadImage(url string, filePath string, wg *sync.WaitGroup, errChan chan<- error) {
 	defer wg.Done()
 
-	fmt.Printf("Starting download for: %s\n", url)
-		
 	file, err := os.Create(filePath)
 	if err != nil {
 		errChan <- fmt.Errorf("failed to create file %s: %w", filePath, err)
@@ -44,70 +41,75 @@ func downloadImage(url string, filePath string, wg *sync.WaitGroup, errChan chan
 		errChan <- fmt.Errorf("failed to write image to file %s: %w", filePath, err)
 		return
 	}
-
-	fmt.Printf("Successfully downloaded: %s to %s\n", url, filePath)
 }
 
-func DownloadImagesConcurrently(imageURLs []string, destDir string) {
-	if _, err := os.Stat(destDir); os.IsNotExist(err) {
-		fmt.Printf("Creating directory: %s\n", destDir)
-		err = os.MkdirAll(destDir, 0755)
-		if err != nil {
-			fmt.Printf("Error creating directory %s: %v\n", destDir, err)
-			return
+func generateFilename(originalURL string) string {
+	parsedURL, err := url.Parse(originalURL)
+	if err != nil {
+		hash := sha256.Sum256([]byte(originalURL))
+		return fmt.Sprintf("image_%x.jpg", hash[:8])
+	}
+
+	fileName := ""
+	if (parsedURL.Host == "nextjs.org" && strings.HasPrefix(parsedURL.Path, "/_next/image")) ||
+		(parsedURL.Host == "vercel-storage.com" && strings.Contains(parsedURL.Path, "/_next/image")) {
+		if rawImageURL := parsedURL.Query().Get("url"); rawImageURL != "" {
+			if decodedImageURL, err := url.QueryUnescape(rawImageURL); err == nil {
+				fileName = filepath.Base(decodedImageURL)
+			}
 		}
 	}
 
+	if fileName == "" {
+		fileName = filepath.Base(parsedURL.Path)
+		if fileName == "." || fileName == "/" {
+			hash := sha256.Sum256([]byte(originalURL))
+			fileName = fmt.Sprintf("image_%x", hash[:8])
+		}
+	}
+
+	if filepath.Ext(fileName) == "" {
+		pathExt := filepath.Ext(parsedURL.Path)
+		if pathExt != "" {
+			fileName += pathExt
+		} else {
+			fileName += ".jpg"
+		}
+	}
+
+	reg := regexp.MustCompile(`[^a-zA-Z0-9\.\-_]`)
+	return reg.ReplaceAllString(fileName, "_")
+}
+
+func downloadHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var request struct {
+		URLs []string `json:"urls"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	destDir := "downloaded_images"
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		http.Error(w, "Failed to create directory", http.StatusInternalServerError)
+		return
+	}
+
 	var wg sync.WaitGroup
-	errChan := make(chan error, len(imageURLs))
+	errChan := make(chan error, len(request.URLs))
+	results := make([]string, 0, len(request.URLs))
 
-	fmt.Printf("Starting concurrent image downloads to %s...\n", destDir)
-	startTime := time.Now()
-
-	for _, originalURL := range imageURLs {
+	for _, originalURL := range request.URLs {
 		wg.Add(1)
-
-		parsedURL, err := url.Parse(originalURL)
-		if err != nil {
-			errChan <- fmt.Errorf("failed to parse URL %s: %w", originalURL, err)
-			wg.Done()
-			continue
-		}
-
-		fileName := ""
-		if (parsedURL.Host == "nextjs.org" && strings.HasPrefix(parsedURL.Path, "/_next/image")) ||
-		   (parsedURL.Host == "vercel-storage.com" && strings.Contains(parsedURL.Path, "/_next/image")) {
-			rawImageURL := parsedURL.Query().Get("url")
-			if rawImageURL != "" {
-				decodedImageURL, decodeErr := url.QueryUnescape(rawImageURL)
-				if decodeErr == nil {
-					fileName = filepath.Base(decodedImageURL)
-				}
-			}
-		}
-
-		if fileName == "" || fileName == "." || fileName == "/" {
-			fileName = filepath.Base(parsedURL.Path)
-			if fileName == "." || fileName == "/" || fileName == "" {
-				hash := sha256.Sum256([]byte(originalURL))
-				fileName = fmt.Sprintf("image_%x", hash[:8])
-			}
-		}
-
-		if filepath.Ext(fileName) == "" {
-			pathExt := filepath.Ext(parsedURL.Path)
-			if pathExt != "" && (pathExt == ".jpg" || pathExt == ".jpeg" || pathExt == ".png" || pathExt == ".gif" || pathExt == ".webp") {
-				fileName += pathExt
-			} else {
-				fileName += ".jpg"
-			}
-		}
-
-		reg := regexp.MustCompile(`[^a-zA-Z0-9\.\-_]`)
-		fileName = reg.ReplaceAllString(fileName, "_")
-
+		fileName := generateFilename(originalURL)
 		filePath := filepath.Join(destDir, fileName)
-
+		results = append(results, filePath)
 		go downloadImage(originalURL, filePath, &wg, errChan)
 	}
 
@@ -116,39 +118,30 @@ func DownloadImagesConcurrently(imageURLs []string, destDir string) {
 
 	hasErrors := false
 	for err := range errChan {
-		fmt.Printf("Download error: %v\n", err)
+		fmt.Println("Download error:", err)
 		hasErrors = true
 	}
 
-	if hasErrors {
-		fmt.Println("Some images failed to download.")
-	} else {
-		fmt.Println("All images processed successfully (or no errors reported).")
+	response := struct {
+		Success   bool     `json:"success"`
+		SavedTo   []string `json:"saved_to"`
+		ErrorCount int     `json:"error_count"`
+	}{
+		Success:   !hasErrors,
+		SavedTo:   results,
+		ErrorCount: len(request.URLs) - len(results),
 	}
 
-	fmt.Printf("All downloads completed in %v\n", time.Since(startTime))
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 func main() {
-	scanner := bufio.NewScanner(os.Stdin)
-	var urls []string
-
-	fmt.Println("Enter image URLs (one per line). Press Enter on an empty line to start downloading:")
-	for scanner.Scan() {
-		url := strings.TrimSpace(scanner.Text())
-		if url == "" {
-			break
-		}
-		urls = append(urls, url)
+	http.HandleFunc("/download", downloadHandler)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
-
-	if len(urls) == 0 {
-		fmt.Println("No URLs provided. Exiting.")
-		return
-	}
-
-	destinationDirectory := "downloaded_images"
-	fmt.Printf("Downloading %d images to %s...\n", len(urls), destinationDirectory)
-	
-	DownloadImagesConcurrently(urls, destinationDirectory)
+	fmt.Printf("Server started on :%s\n", port)
+	http.ListenAndServe(":"+port, nil)
 }
