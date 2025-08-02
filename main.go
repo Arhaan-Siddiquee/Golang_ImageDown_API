@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,6 +18,53 @@ import (
 
 	"github.com/rs/cors"
 )
+
+func main() {
+	c := cors.New(cors.Options{
+		AllowedOrigins:   []string{"*"},
+		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
+		AllowedHeaders:   []string{"Content-Type"},
+		AllowCredentials: true,
+		MaxAge:          300,
+	})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", rootHandler)
+	mux.HandleFunc("/download", downloadHandler)
+	mux.HandleFunc("/health", healthHandler)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Printf("Server started on :%s\n", port)
+	log.Fatal(http.ListenAndServe(":"+port, c.Handler(mux)))
+}
+
+func rootHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "active",
+		"message": "Image Download API - POST to /download",
+		"endpoints": map[string]string{
+			"download": "/download",
+			"health":   "/health",
+		},
+	})
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "OK",
+	})
+}
 
 func downloadImage(url string, filePath string, wg *sync.WaitGroup, errChan chan<- error) {
 	defer wg.Done()
@@ -44,8 +92,7 @@ func downloadImage(url string, filePath string, wg *sync.WaitGroup, errChan chan
 	}
 	defer file.Close()
 
-	_, err = io.Copy(file, resp.Body)
-	if err != nil {
+	if _, err := io.Copy(file, resp.Body); err != nil {
 		errChan <- fmt.Errorf("failed to write image to file %s: %v", filePath, err)
 	}
 }
@@ -89,10 +136,17 @@ func generateFilename(originalURL string) string {
 }
 
 func cleanOldFiles(dir string) {
-	files, _ := os.ReadDir(dir)
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+
 	now := time.Now()
 	for _, file := range files {
-		info, _ := file.Info()
+		info, err := file.Info()
+		if err != nil {
+			continue
+		}
 		if now.Sub(info.ModTime()) > 24*time.Hour {
 			os.Remove(filepath.Join(dir, file.Name()))
 		}
@@ -101,58 +155,63 @@ func cleanOldFiles(dir string) {
 
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
+		w.Header().Set("Allow", "POST")
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	var request struct {
-		URLs      []string `json:"urls"`
+		ImageURLs []string `json:"imageURLs"`
+		DestDir   string   `json:"destDir"`
 		ZipReturn bool     `json:"zipReturn"`
 	}
+
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	if len(request.URLs) == 0 {
+	if len(request.ImageURLs) == 0 {
 		http.Error(w, "No URLs provided", http.StatusBadRequest)
 		return
 	}
 
-	if len(request.URLs) > 10 {
-		http.Error(w, "Maximum 10 URLs allowed", http.StatusBadRequest)
+	if len(request.ImageURLs) > 20 {
+		http.Error(w, "Maximum 20 URLs allowed", http.StatusBadRequest)
 		return
 	}
 
 	destDir := "downloaded_images"
+	if request.DestDir != "" {
+		destDir = request.DestDir
+	}
+
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		http.Error(w, "Failed to create directory", http.StatusInternalServerError)
 		return
 	}
 
-	if time.Now().Hour() == 0 { 
-		cleanOldFiles(destDir)
-	}
+	cleanOldFiles(destDir)
 
 	var wg sync.WaitGroup
-	errChan := make(chan error, len(request.URLs))
-	downloadedFiles := make([]string, 0, len(request.URLs))
+	errChan := make(chan error, len(request.ImageURLs))
+	downloadedFiles := make([]string, 0, len(request.ImageURLs))
 
-	for _, originalURL := range request.URLs {
+	for _, originalURL := range request.ImageURLs {
 		wg.Add(1)
 		fileName := generateFilename(originalURL)
 		filePath := filepath.Join(destDir, fileName)
-		downloadedFiles = append(downloadedFiles, filePath)
+		downloadedFiles = append(downloadedFiles, fileName)
 		go downloadImage(originalURL, filePath, &wg, errChan)
 	}
 
 	wg.Wait()
 	close(errChan)
 
-	hasErrors := false
+	errorCount := 0
 	for err := range errChan {
-		fmt.Println("Download error:", err)
-		hasErrors = true
+		log.Println("Download error:", err)
+		errorCount++
 	}
 
 	if request.ZipReturn {
@@ -163,60 +222,32 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		defer zipWriter.Close()
 
 		for _, filePath := range downloadedFiles {
-			file, err := os.Open(filePath)
+			fullPath := filepath.Join(destDir, filePath)
+			file, err := os.Open(fullPath)
 			if err != nil {
 				continue
 			}
 
-			entry, err := zipWriter.Create(filepath.Base(filePath))
+			entry, err := zipWriter.Create(filePath)
 			if err != nil {
 				file.Close()
 				continue
 			}
 
-			_, err = io.Copy(entry, file)
-			file.Close()
-			if err != nil {
+			if _, err := io.Copy(entry, file); err != nil {
+				file.Close()
 				continue
 			}
+			file.Close()
 		}
 	} else {
-		response := struct {
-			Success    bool     `json:"success"`
-			SavedPaths []string `json:"savedPaths"`
-			ErrorCount int      `json:"errorCount"`
-		}{
-			Success:    !hasErrors,
-			SavedPaths: downloadedFiles,
-			ErrorCount: len(request.URLs) - len(downloadedFiles),
-		}
-
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":    errorCount == 0,
+			"downloaded": len(request.ImageURLs) - errorCount,
+			"errors":     errorCount,
+			"files":      downloadedFiles,
+			"message":    fmt.Sprintf("Downloaded %d of %d files", len(request.ImageURLs)-errorCount, len(request.ImageURLs)),
+		})
 	}
-}
-
-func main() {
-	c := cors.New(cors.Options{
-		AllowedOrigins:   []string{"*"},
-		AllowedMethods:  []string{"GET", "POST", "OPTIONS"},
-		AllowedHeaders:  []string{"Content-Type"},
-		MaxAge:          300,
-	})
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/download", downloadHandler)
-
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-
-	fmt.Printf("Server started on :%s\n", port)
-	http.ListenAndServe(":"+port, c.Handler(mux))
 }
