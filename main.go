@@ -47,32 +47,21 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":  "active",
 		"message": "Image Download API - POST to /download",
-		"endpoints": map[string]string{
-			"download": "/download",
-			"health":   "/health",
-		},
 	})
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status": "OK",
-	})
+	json.NewEncoder(w).Encode(map[string]string{"status": "OK"})
 }
 
 func downloadImage(url string, filePath string, wg *sync.WaitGroup, errChan chan<- error) {
 	defer wg.Done()
-
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
 		errChan <- fmt.Errorf("failed to fetch URL %s: %v", url, err)
@@ -135,24 +124,6 @@ func generateFilename(originalURL string) string {
 	return reg.ReplaceAllString(fileName, "_")
 }
 
-func cleanOldFiles(dir string) {
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		return
-	}
-
-	now := time.Now()
-	for _, file := range files {
-		info, err := file.Info()
-		if err != nil {
-			continue
-		}
-		if now.Sub(info.ModTime()) > 24*time.Hour {
-			os.Remove(filepath.Join(dir, file.Name()))
-		}
-	}
-}
-
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		w.Header().Set("Allow", "POST")
@@ -163,7 +134,6 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		ImageURLs []string `json:"imageURLs"`
 		DestDir   string   `json:"destDir"`
-		ZipReturn bool     `json:"zipReturn"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -176,33 +146,23 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(request.ImageURLs) > 20 {
-		http.Error(w, "Maximum 20 URLs allowed", http.StatusBadRequest)
-		return
-	}
-
-	destDir := "downloaded_images"
-	if request.DestDir != "" {
-		destDir = request.DestDir
-	}
-
+	destDir := "temp_downloads"
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		http.Error(w, "Failed to create directory", http.StatusInternalServerError)
 		return
 	}
-
-	cleanOldFiles(destDir)
+	defer os.RemoveAll(destDir)
 
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(request.ImageURLs))
 	downloadedFiles := make([]string, 0, len(request.ImageURLs))
 
-	for _, originalURL := range request.ImageURLs {
+	for _, url := range request.ImageURLs {
 		wg.Add(1)
-		fileName := generateFilename(originalURL)
+		fileName := generateFilename(url)
 		filePath := filepath.Join(destDir, fileName)
-		downloadedFiles = append(downloadedFiles, fileName)
-		go downloadImage(originalURL, filePath, &wg, errChan)
+		downloadedFiles = append(downloadedFiles, filePath)
+		go downloadImage(url, filePath, &wg, errChan)
 	}
 
 	wg.Wait()
@@ -214,40 +174,33 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		errorCount++
 	}
 
-	if request.ZipReturn {
-		w.Header().Set("Content-Type", "application/zip")
-		w.Header().Set("Content-Disposition", "attachment; filename=images.zip")
+	if len(downloadedFiles) == 0 {
+		http.Error(w, "No files were downloaded", http.StatusInternalServerError)
+		return
+	}
 
-		zipWriter := zip.NewWriter(w)
-		defer zipWriter.Close()
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", "attachment; filename=images.zip")
 
-		for _, filePath := range downloadedFiles {
-			fullPath := filepath.Join(destDir, filePath)
-			file, err := os.Open(fullPath)
-			if err != nil {
-				continue
-			}
+	zipWriter := zip.NewWriter(w)
+	defer zipWriter.Close()
 
-			entry, err := zipWriter.Create(filePath)
-			if err != nil {
-				file.Close()
-				continue
-			}
-
-			if _, err := io.Copy(entry, file); err != nil {
-				file.Close()
-				continue
-			}
-			file.Close()
+	for _, filePath := range downloadedFiles {
+		file, err := os.Open(filePath)
+		if err != nil {
+			continue
 		}
-	} else {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":    errorCount == 0,
-			"downloaded": len(request.ImageURLs) - errorCount,
-			"errors":     errorCount,
-			"files":      downloadedFiles,
-			"message":    fmt.Sprintf("Downloaded %d of %d files", len(request.ImageURLs)-errorCount, len(request.ImageURLs)),
-		})
+
+		entry, err := zipWriter.Create(filepath.Base(filePath))
+		if err != nil {
+			file.Close()
+			continue
+		}
+
+		if _, err := io.Copy(entry, file); err != nil {
+			file.Close()
+			continue
+		}
+		file.Close()
 	}
 }
